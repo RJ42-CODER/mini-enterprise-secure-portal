@@ -15,8 +15,15 @@ if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
 try:
+    from .config import load_portal_env, validate_portal_config
+    load_portal_env()
     from .detector import ServerDetector
 except ImportError:
+    try:
+        from config import load_portal_env, validate_portal_config
+        load_portal_env()
+    except ImportError:
+        pass
     from detector import ServerDetector
 
 class NetworkSniffer:
@@ -251,25 +258,16 @@ class NetworkSniffer:
         print("[*] [SNIFFER] Stopped network telemetry monitoring.")
 
 if __name__ == "__main__":
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
-
-    cn_server_ip = os.getenv("CN_SERVER_IP")
-    soc_url = os.getenv("SOC_URL")
-    if not cn_server_ip:
-        raise ValueError("CN_SERVER_IP is not configured. Set CN_SERVER_IP in your .env file or environment, e.g. 192.168.31.91")
-    if not soc_url:
-        raise ValueError("SOC_URL is not configured. Set SOC_URL in your .env file or environment, e.g. http://192.168.31.204:5050")
-        
-    print(f"[CONFIG] CN_SERVER_IP={cn_server_ip}")
-    print(f"[CONFIG] SOC_URL={soc_url}")
-    
+    load_portal_env()
+    config = validate_portal_config()
+    cn_server_ip = config["CN_SERVER_IP"]
+    soc_url = config["SOC_URL"]
     api_key = os.getenv("SOC_API_KEY") or os.getenv("SOC_AGENT_TOKEN")
-    if not api_key:
-        raise ValueError("SOC authentication token is not configured. Set SOC_API_KEY or SOC_AGENT_TOKEN.")
+
+    print("[CONFIG] Network Sniffer initializing with validated parameters:")
+    print(f"  CN_SERVER_IP = {cn_server_ip}")
+    print(f"  SOC_URL      = {soc_url}")
+    print("  SOC AUTH     = [CONFIGURED]")
 
     print(f"[*] Starting Protected Web Server Network Sniffer -> {soc_url}")
     sniffer = NetworkSniffer(soc_url=soc_url, api_key=api_key)

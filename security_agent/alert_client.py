@@ -6,6 +6,16 @@ import requests
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 
+try:
+    from .config import load_portal_env
+    load_portal_env()
+except ImportError:
+    try:
+        from config import load_portal_env
+        load_portal_env()
+    except ImportError:
+        pass
+
 class AlertClient:
     """
     Transmits security telemetry from protected server to SOC backend.
@@ -16,7 +26,7 @@ class AlertClient:
     def __init__(self, soc_url: Optional[str] = None, api_key: Optional[str] = None, spool_dir: Optional[str] = None):
         final_soc_url = soc_url or os.getenv("SOC_URL")
         if not final_soc_url:
-            raise ValueError("SOC_URL is not configured. Set SOC_URL to the Victus SOC backend, e.g. http://192.168.31.204:5050")
+            raise ValueError("SOC_URL is not configured. Set SOC_URL to the Victus SOC backend, e.g. http://192.168.31.73:8443")
         self.soc_url = final_soc_url.rstrip("/")
         
         # Require explicit token; support both SOC_API_KEY and SOC_AGENT_TOKEN
@@ -53,6 +63,12 @@ class AlertClient:
         if not valid:
             return False, {"error": "ValidationError", "detail": err_msg, "buffered": False}
 
+        # Prepare payload and map non-standard severity (e.g. INFO) to LOW for SOC compatibility
+        payload = dict(event_payload)
+        raw_sev = str(payload.get("severity", "MEDIUM")).strip()
+        if raw_sev.upper() in ("INFO", "INFORMATIONAL", "DEBUG", "NOTICE", ""):
+            payload["severity"] = "LOW"
+
         # First attempt to flush any previously spooled events
         self._flush_spool_quietly()
 
@@ -62,7 +78,7 @@ class AlertClient:
             "User-Agent": "HP-Victus-Security-Agent/1.0"
         }
         try:
-            response = requests.post(self.endpoint, json=event_payload, headers=headers, timeout=5)
+            response = requests.post(self.endpoint, json=payload, headers=headers, timeout=5)
             # Accept HTTP 200 OK, 201 Created, and 202 Accepted
             if response.status_code in (200, 201, 202):
                 try:
@@ -81,17 +97,21 @@ class AlertClient:
                 return False, {"error": err_type, "detail": f"SOC rejected payload (HTTP {response.status_code}): {response.text[:200]}", "status_code": response.status_code, "buffered": False}
             elif response.status_code >= 500:
                 # Server side error - buffer for retry
-                self._buffer_event(event_payload)
+                self._buffer_event(payload)
                 return False, {"error": f"HTTP {response.status_code}", "detail": "SOC internal error (HTTP 5xx)", "status_code": response.status_code, "buffered": True}
             else:
                 # Other 4xx client errors (bad request / duplicate / forbidden) - do not infinite retry
                 return False, {"error": f"HTTP {response.status_code}", "detail": response.text[:200], "status_code": response.status_code, "buffered": False}
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             # SOC unreachable - buffer event
-            self._buffer_event(event_payload)
-            return False, {"error": "ConnectionError", "detail": str(e), "buffered": True}
+            self._buffer_event(payload)
+            return False, {
+                "error": "ConnectionError",
+                "detail": f"SOC API at {self.endpoint} is unreachable ({type(e).__name__}): {e}. Event buffered locally to {self.spool_file.name} for retry.",
+                "buffered": True
+            }
         except Exception as e:
-            self._buffer_event(event_payload)
+            self._buffer_event(payload)
             return False, {"error": "UnexpectedError", "detail": str(e), "buffered": True}
 
     def _buffer_event(self, event_payload: Dict[str, Any]):
@@ -142,6 +162,11 @@ class AlertClient:
                 except Exception:
                     # Drop malformed line
                     continue
+
+                # Normalize non-standard severity (e.g. INFO) before retry delivery
+                raw_sev = str(payload.get("severity", "MEDIUM")).strip()
+                if raw_sev.upper() in ("INFO", "INFORMATIONAL", "DEBUG", "NOTICE", ""):
+                    payload["severity"] = "LOW"
 
                 try:
                     res = requests.post(self.endpoint, json=payload, headers=headers, timeout=5)

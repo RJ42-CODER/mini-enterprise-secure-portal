@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock
 
 # Mock env vars before importing anything that evaluates them at module level
 os.environ["CN_SERVER_IP"] = "192.168.31.91"
-os.environ["SOC_URL"] = "http://192.168.31.204:5050"
+os.environ["SOC_URL"] = "http://192.168.31.73:8443"
 os.environ["SOC_API_KEY"] = "mock_test_token"
 
 from security_agent.network_sniffer import NetworkSniffer

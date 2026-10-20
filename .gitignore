@@ -49,7 +49,26 @@ logs/*
 *.swo
 *~
 
+# Backup & temporary files
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+*.tmp
+
+# Network packet captures & dumps
+*.pcap
+*.pcapng
+*.cap
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
 # Operating System files
 .DS_Store
 Thumbs.db
 desktop.ini
+

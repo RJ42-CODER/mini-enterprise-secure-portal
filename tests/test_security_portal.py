@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 
 # Set required test env vars before imports
 os.environ["CN_SERVER_IP"] = "192.168.31.91"
-os.environ["SOC_URL"] = "http://127.0.0.1:8443"
+os.environ["SOC_URL"] = "http://192.168.31.73:8443"
 os.environ["SOC_API_KEY"] = "mock_test_token"
 os.environ["PORT"] = "5000"
 os.environ["PORTAL_ADMIN_PASSWORD"] = "admin123"

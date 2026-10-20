@@ -3,10 +3,17 @@ import os
 import time
 from typing import Optional, Dict, Any, Tuple, List
 try:
+    from .config import load_portal_env
+    load_portal_env()
     from .event_logger import EventLogger
     from .alert_client import AlertClient
     from .waf import WAFInspector, WAFConfig
 except ImportError:
+    try:
+        from config import load_portal_env
+        load_portal_env()
+    except ImportError:
+        pass
     from event_logger import EventLogger
     from alert_client import AlertClient
     from waf import WAFInspector, WAFConfig
@@ -163,7 +170,7 @@ class ServerDetector:
         return self._trigger_event(
             event_type="PORT_SCAN",
             signature="PORT_SCAN",
-            severity="INFO",
+            severity="LOW",
             source_ip=source_ip,
             destination_port=destination_port,
             message=msg,

@@ -11,21 +11,27 @@ except ImportError:
 
 # Ensure we can import security_agent
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+from security_agent.config import load_portal_env, validate_portal_config, get_client_ip
 from security_agent.detector import ServerDetector
 
+# Load environment settings from project .env
+load_portal_env()
+
+# Perform startup configuration validation for all required parameters
+config = validate_portal_config()
+cn_server_ip = config["CN_SERVER_IP"]
+soc_url = config["SOC_URL"]
+server_port = config["PORT"]
+flask_host = config["FLASK_HOST"]
+
+print("[CONFIG] Security Portal initializing with validated parameters:")
+print(f"  CN_SERVER_IP = {cn_server_ip}")
+print(f"  SOC_URL      = {soc_url}")
+print(f"  PORT         = {server_port}")
+print(f"  FLASK_HOST   = {flask_host}")
+print("  SOC AUTH     = [CONFIGURED]")
+
 app = Flask(__name__)
-
-cn_server_ip = os.getenv("CN_SERVER_IP")
-soc_url = os.getenv("SOC_URL")
-if not cn_server_ip:
-    raise ValueError("CN_SERVER_IP is not configured. Set CN_SERVER_IP in your .env file or environment (e.g. 192.168.31.91).")
-if not soc_url:
-    raise ValueError("SOC_URL is not configured. Set SOC_URL in your .env file or environment (e.g. http://192.168.31.204:5050).")
-
-server_port = int(os.getenv("PORT", "5000"))
-print(f"[CONFIG] CN_SERVER_IP={cn_server_ip}")
-print(f"[CONFIG] SOC_URL={soc_url}")
-print(f"[CONFIG] PORT={server_port}")
 
 detector = ServerDetector(port=server_port)
 app.config['MAX_CONTENT_LENGTH'] = detector.waf.config.max_content_length
@@ -39,8 +45,9 @@ def before_request():
         except Exception:
             pass
 
+    client_ip = get_client_ip(request)
     event = detector.inspect_http_request(
-        source_ip=request.remote_addr or "127.0.0.1",
+        source_ip=client_ip,
         path=request.path,
         method=request.method,
         headers=dict(request.headers),
@@ -54,11 +61,12 @@ def before_request():
 
 @app.errorhandler(413)
 def request_entity_too_large(error):
+    client_ip = get_client_ip(request)
     detector._trigger_event(
         event_type="REQUEST_SIZE_LIMIT",
         signature="DIR_FUZZ",
         severity="MEDIUM",
-        source_ip=request.remote_addr or "127.0.0.1",
+        source_ip=client_ip,
         destination_port=server_port,
         message=f"Request body exceeded maximum content length limit ({detector.waf.config.max_content_length} bytes)",
         metadata={"size": request.content_length or 0, "max_allowed": detector.waf.config.max_content_length}
@@ -177,16 +185,17 @@ def login():
         password = request.form.get("password")
         expected_password = os.getenv("PORTAL_ADMIN_PASSWORD", "admin123")
 
+        client_ip = get_client_ip(request)
         if username == "admin" and password == expected_password:
             message = "Login successful"
             detector.record_auth_success(
-                source_ip=request.remote_addr or "127.0.0.1",
+                source_ip=client_ip,
                 username=username or ""
             )
         else:
             message = "Invalid username or password"
             detector.record_auth_failure(
-                source_ip=request.remote_addr or "127.0.0.1",
+                source_ip=client_ip,
                 username=username or ""
             )
 
@@ -194,5 +203,5 @@ def login():
 
 
 if __name__ == "__main__":
-    flask_host = os.getenv("FLASK_HOST", "0.0.0.0")
-    app.run(host=flask_host, port=server_port)
+    app_host = os.getenv("FLASK_HOST", "127.0.0.1")
+    app.run(host=app_host, port=server_port)
