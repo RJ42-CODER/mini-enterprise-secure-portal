@@ -17,7 +17,7 @@ os.environ["WAF_AUTH_LOCKOUT_THRESHOLD"] = "3"
 os.environ["WAF_AUTH_LOCKOUT_SECONDS"] = "2"
 os.environ["WAF_AUTH_DECAY_SECONDS"] = "10"
 
-from security_agent.waf import WAFConfig, WAFInspector, RateLimiter, BruteForceProtector
+from security_agent.waf import WAFConfig, WAFInspector, RateLimiter, BruteForceProtector, DirectoryFuzzTracker
 from security_agent.detector import ServerDetector
 from app import app
 
@@ -335,3 +335,130 @@ def test_flask_host_binding_configuration():
     assert prod_host in ("127.0.0.1", "localhost"), (
         "Flask must bind to localhost (127.0.0.1) in production behind Nginx reverse proxy."
     )
+
+
+# ==============================================================================
+# Requirement 11: Directory Discovery & 404 Fuzzing Tracking
+# ==============================================================================
+
+def test_directory_fuzz_tracker_threshold_and_cooldown():
+    """Verify DirectoryFuzzTracker triggers alert when distinct 404 paths reach threshold."""
+    tracker = DirectoryFuzzTracker(threshold=4, window_seconds=60, cooldown_seconds=5)
+    ip = "192.168.1.100"
+
+    # First 3 distinct 404 probes - below threshold
+    assert tracker.record_404_probe(ip, "/page1") == (False, None)
+    assert tracker.record_404_probe(ip, "/page2") == (False, None)
+    # Duplicate probe to /page2 should not increment distinct count
+    assert tracker.record_404_probe(ip, "/page2") == (False, None)
+    assert tracker.record_404_probe(ip, "/page3") == (False, None)
+
+    # 4th distinct probe reaches threshold (4)
+    detected, info = tracker.record_404_probe(ip, "/page4")
+    assert detected is True
+    assert info is not None
+    assert info["distinct_count"] == 4
+    assert info["severity"] == "HIGH"
+    assert "/page1" in info["probed_paths"]
+    assert "/page4" in info["probed_paths"]
+
+    # 5th probe within cooldown period - debounced
+    assert tracker.record_404_probe(ip, "/page5") == (False, None)
+
+
+def test_directory_fuzz_tracker_sliding_window_expiration():
+    """Verify probes outside the sliding time window expire and do not trigger alert."""
+    tracker = DirectoryFuzzTracker(threshold=3, window_seconds=1, cooldown_seconds=1)
+    ip = "192.168.1.101"
+
+    tracker.record_404_probe(ip, "/old1")
+    tracker.record_404_probe(ip, "/old2")
+    # Wait for window to expire
+    time.sleep(1.1)
+
+    # New probe after window expired: only 1 distinct path in active window
+    detected, info = tracker.record_404_probe(ip, "/new1")
+    assert detected is False
+    assert info is None
+
+
+def test_record_not_found_scanner_user_agent(test_client):
+    """Verify reconnaissance scanner User-Agent is blocked by WAF or flagged on 404."""
+    from app import detector
+    with patch.object(detector.client, '_flush_spool_quietly'):
+        with patch('requests.post') as mock_post:
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.json.return_value = {"status": "success"}
+
+            # Through HTTP client: intercepted by WAF before_request with 403
+            resp = test_client.get(
+                "/nonexistent-path",
+                headers={"User-Agent": "gobuster/3.1.0"}
+            )
+            assert resp.status_code == 403
+            assert b"Reconnaissance tool detected" in resp.data
+
+            # Telemetry was triggered for scanner
+            mock_post.assert_called_once()
+            payload = mock_post.call_args[1]["json"]
+            assert payload["signature"] == "DIR_FUZZ"
+            assert payload["severity"] == "HIGH"
+            assert payload["event_type"] == "DIR_FUZZ"
+            assert "gobuster" in payload["message"].lower()
+
+            # Directly via record_not_found: returns DIR_FUZZ event
+            event = detector.record_not_found(
+                source_ip="192.168.1.102",
+                path="/test-probe",
+                headers={"User-Agent": "dirbuster/1.0"}
+            )
+            assert event is not None
+            assert event["signature"] == "DIR_FUZZ"
+            assert event["metadata"]["trigger"] == "recon_scanner_user_agent"
+
+
+def test_record_not_found_explicit_suspicious_path(test_client):
+    """Verify explicit suspicious path probe generates debounced DIR_FUZZ alert."""
+    from app import detector
+    with patch.object(detector.client, '_flush_spool_quietly'):
+        with patch('requests.post') as mock_post:
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.json.return_value = {"status": "success"}
+
+            # First probe to sensitive file
+            resp1 = test_client.get("/wp-admin")
+            # In WAF before_request it might be blocked with 403 as SENSITIVE_PATH_PROBE,
+            # or if it reaches 404 errorhandler, record_not_found catches it.
+            # Let's test a path that is not in WAF SENSITIVE_PATHS before_request, e.g. with extension
+            resp2 = test_client.get("/database.sql")
+            assert resp2.status_code in (400, 403, 404)
+            mock_post.assert_called()
+            payload = mock_post.call_args[1]["json"]
+            assert payload["signature"] == "DIR_FUZZ"
+
+
+def test_record_not_found_distinct_404_fuzzing_burst(test_client):
+    """Verify repeated distinct 404 requests trigger DIR_FUZZ alert once threshold is hit."""
+    from app import detector
+    detector.fuzz_tracker.reset_ip("127.0.0.1")
+    threshold = detector.fuzz_tracker.threshold
+
+    with patch.object(detector.client, '_flush_spool_quietly'):
+        with patch('requests.post') as mock_post:
+            mock_post.return_value.status_code = 200
+            mock_post.return_value.json.return_value = {"status": "success"}
+
+            # Send distinct benign-looking 404 paths up to threshold
+            for i in range(1, threshold):
+                resp = test_client.get(f"/random_unknown_page_{i}")
+                assert resp.status_code == 404
+            mock_post.assert_not_called()
+
+            # The threshold-reaching 404 request
+            resp = test_client.get(f"/random_unknown_page_{threshold}")
+            assert resp.status_code == 404
+            mock_post.assert_called_once()
+            payload = mock_post.call_args[1]["json"]
+            assert payload["signature"] == "DIR_FUZZ"
+            assert payload["metadata"]["distinct_count"] == threshold
+

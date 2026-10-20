@@ -1,14 +1,22 @@
 import uuid
 import os
+import sys
 import time
+from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
+
+# Ensure agent directory is in sys.path for fallback standalone execution
+AGENT_DIR = Path(__file__).resolve().parent
+if str(AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(AGENT_DIR))
+
 try:
     from .config import load_portal_env
     load_portal_env()
     from .event_logger import EventLogger
     from .alert_client import AlertClient
-    from .waf import WAFInspector, WAFConfig
-except ImportError:
+    from .waf import WAFInspector, WAFConfig, DirectoryFuzzTracker
+except (ImportError, ValueError):
     try:
         from config import load_portal_env
         load_portal_env()
@@ -16,7 +24,7 @@ except ImportError:
         pass
     from event_logger import EventLogger
     from alert_client import AlertClient
-    from waf import WAFInspector, WAFConfig
+    from waf import WAFInspector, WAFConfig, DirectoryFuzzTracker
 
 class ServerDetector:
     """Security detection engine operating on protected server."""
@@ -32,6 +40,11 @@ class ServerDetector:
         # ip -> list of failure timestamps (sliding window)
         self.failed_logins: Dict[str, List[float]] = {}
         self.auth_decay_seconds = 300  # 5 minute sliding decay window
+        self.fuzz_tracker = DirectoryFuzzTracker(
+            threshold=getattr(self.waf.config, "dir_fuzz_threshold", 5),
+            window_seconds=getattr(self.waf.config, "dir_fuzz_window_seconds", 60),
+            cooldown_seconds=getattr(self.waf.config, "dir_fuzz_cooldown_seconds", 10)
+        )
 
     def inspect_http_request(
         self,
@@ -62,6 +75,10 @@ class ServerDetector:
         sanitized_metadata = dict(detection.get("metadata", {}))
         if "body" in sanitized_metadata:
             sanitized_metadata["body"] = sanitized_metadata["body"][:150]
+        sanitized_metadata.setdefault("http_method", method.upper())
+        sanitized_metadata.setdefault("requested_path", path)
+        sanitized_metadata.setdefault("response_status", detection.get("status_code", 403 if detection.get("blocked") else 200))
+        sanitized_metadata.setdefault("detection_reason", detection.get("message", "WAF rule violation detected"))
 
         sig = detection.get("signature", "DIR_FUZZ")
         event_type = sig if sig in ("SQL_INJECTION", "COMMAND_INJECTION", "PATH_TRAVERSAL", "DIR_FUZZ", "PORT_SCAN") else detection.get("rule", sig)
@@ -106,6 +123,97 @@ class ServerDetector:
         )
         if event and event.get("_waf_blocked") and event.get("_waf_detection"):
             return self.waf.build_client_response(event["_waf_detection"])
+        return None
+
+
+    def record_not_found(
+        self,
+        source_ip: str,
+        path: str,
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        status_code: int = 404
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Evaluate HTTP 404 responses for directory discovery attacks.
+        Distinguishes benign 404s, explicit suspicious path probes, and repeated distinct fuzzing bursts.
+        Preserves source_ip, http_method, requested_path, timestamp, response_status, detection_reason.
+        """
+        headers = headers or {}
+        ua = headers.get("User-Agent", "").lower()
+
+        # 1. Recon scanner tool User-Agent probe
+        for tool in self.waf.SCANNER_AGENTS:
+            if tool in ua:
+                msg = f"Reconnaissance scanner detected ({tool}) targeting {path}"
+                return self._trigger_event(
+                    event_type="DIR_FUZZ",
+                    signature="DIR_FUZZ",
+                    severity="HIGH",
+                    source_ip=source_ip,
+                    destination_port=self.server_port,
+                    message=msg,
+                    metadata={
+                        "http_method": method.upper(),
+                        "requested_path": path,
+                        "response_status": status_code,
+                        "detection_reason": msg,
+                        "user_agent": headers.get("User-Agent", ""),
+                        "trigger": "recon_scanner_user_agent"
+                    }
+                )
+
+        # 2. Explicit suspicious path indicator
+        is_suspicious, matched_indicator = self.waf.is_explicit_suspicious_path(path)
+        if is_suspicious:
+            now = time.time()
+            key = (source_ip, path)
+            last_sent = self.fuzz_tracker.explicit_path_alerts.get(key, 0)
+            if now - last_sent < self.fuzz_tracker.cooldown_seconds:
+                # Debounced: avoid duplicate alert for identical probe within cooldown
+                return None
+            self.fuzz_tracker.explicit_path_alerts[key] = now
+
+            msg = f"Explicit suspicious path probe detected: {path} (matched '{matched_indicator}')"
+            return self._trigger_event(
+                event_type="DIR_FUZZ",
+                signature="DIR_FUZZ",
+                severity="HIGH",
+                source_ip=source_ip,
+                destination_port=self.server_port,
+                message=msg,
+                metadata={
+                    "http_method": method.upper(),
+                    "requested_path": path,
+                    "response_status": status_code,
+                    "detection_reason": msg,
+                    "matched_indicator": matched_indicator,
+                    "trigger": "explicit_suspicious_path"
+                }
+            )
+
+        # 3. Repeated distinct path probes threshold
+        detected, info = self.fuzz_tracker.record_404_probe(source_ip, path)
+        if detected and info:
+            msg = info["message"]
+            return self._trigger_event(
+                event_type="DIR_FUZZ",
+                signature="DIR_FUZZ",
+                severity=info["severity"],
+                source_ip=source_ip,
+                destination_port=self.server_port,
+                message=msg,
+                metadata={
+                    "http_method": method.upper(),
+                    "requested_path": path,
+                    "response_status": status_code,
+                    "detection_reason": msg,
+                    "distinct_count": info["distinct_count"],
+                    "probed_paths_sample": info["probed_paths"][:10],
+                    "trigger": "threshold_exceeded"
+                }
+            )
+
         return None
 
     def record_auth_failure(self, source_ip: str, username: str) -> Dict[str, Any]:

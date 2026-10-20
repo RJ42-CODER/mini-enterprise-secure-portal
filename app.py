@@ -80,10 +80,23 @@ def request_entity_too_large(error):
 @app.errorhandler(405)
 def method_not_allowed(error):
     return detector.waf.build_client_response({
-        "status_code": 405,
-        "rule": "DISALLOWED_METHOD",
-        "client_message": "405 Method Not Allowed: Specified HTTP method is not permitted."
+        "status_code":405,
+        "rule":"DISALLOWED_METHOD",
+        "client_message":"405 Method Not Allowed"
     })
+
+@app.errorhandler(404)
+def not_found(error):
+    client_ip = get_client_ip(request)
+    detector.record_not_found(
+        source_ip=client_ip,
+        path=request.path,
+        method=request.method,
+        headers=dict(request.headers),
+        status_code=404
+    )
+    return "404 Not Found: The requested resource was not found on this server.", 404
+
 
 HTML = """
 <!DOCTYPE html>
@@ -204,4 +217,4 @@ def login():
 
 if __name__ == "__main__":
     app_host = os.getenv("FLASK_HOST", "127.0.0.1")
-    app.run(host=app_host, port=server_port)
+    app.run(host=app_host, port=server_port)

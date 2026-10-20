@@ -31,6 +31,11 @@ class WAFConfig:
         self.auth_lockout_seconds: int = int(os.getenv("WAF_AUTH_LOCKOUT_SECONDS", "60"))
         self.auth_decay_seconds: int = int(os.getenv("WAF_AUTH_DECAY_SECONDS", "300"))
 
+        # Directory discovery (DIR_FUZZ) policy
+        self.dir_fuzz_threshold: int = int(os.getenv("DIR_FUZZ_THRESHOLD", "5"))
+        self.dir_fuzz_window_seconds: int = int(os.getenv("DIR_FUZZ_WINDOW_SECONDS", "60"))
+        self.dir_fuzz_cooldown_seconds: int = int(os.getenv("DIR_FUZZ_COOLDOWN_SECONDS", "10"))
+
 
 class RateLimiter:
     """Thread-safe sliding-window rate limiter per source IP."""
@@ -107,6 +112,102 @@ class BruteForceProtector:
             self.lockouts.pop(ip, None)
 
 
+class DirectoryFuzzTracker:
+    """
+    Tracks repeated HTTP 404 Not Found responses per client IP to detect directory
+    enumeration / path fuzzing attacks (DIR_FUZZ) in a sliding time window.
+    Supports debounced alert triggering and explicit suspicious path tracking.
+    """
+
+    def __init__(
+        self,
+        threshold: int = 5,
+        window_seconds: int = 60,
+        cooldown_seconds: int = 10
+    ):
+        self.threshold = threshold
+        self.window_seconds = window_seconds
+        self.cooldown_seconds = cooldown_seconds
+        # ip -> list of (timestamp, path)
+        self.probes: Dict[str, List[Tuple[float, str]]] = {}
+        # (ip, path) -> timestamp of last explicit path alert
+        self.explicit_path_alerts: Dict[Tuple[str, str], float] = {}
+        # ip -> timestamp of last threshold burst alert
+        self.last_alert_time: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def record_404_probe(self, source_ip: str, path: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """
+        Record a 404 response for the given source IP and path.
+        Returns (detected, info_dict) if the distinct 404 path count reaches or exceeds
+        the threshold within window_seconds, and cooldown_seconds has elapsed since the last alert.
+        """
+        now = time.time()
+        with self._lock:
+            history = self.probes.get(source_ip, [])
+            window_start = now - self.window_seconds
+            # Keep only probes within the sliding time window
+            active = [(ts, p) for ts, p in history if ts > window_start]
+            active.append((now, path))
+            self.probes[source_ip] = active
+
+            # Periodically prune inactive client tracking entries
+            if len(self.probes) > 2000:
+                self._prune_stale(now)
+
+            # Determine distinct probed paths (preserving discovery order)
+            distinct_paths = list(dict.fromkeys(p for _, p in active))
+            distinct_count = len(distinct_paths)
+
+            if distinct_count >= self.threshold:
+                last_alert = self.last_alert_time.get(source_ip, 0)
+                if now - last_alert < self.cooldown_seconds:
+                    # Debounced within cooldown window
+                    return False, None
+
+                self.last_alert_time[source_ip] = now
+                msg = (
+                    f"Directory discovery / fuzzing attack detected "
+                    f"({distinct_count} distinct 404 paths within {self.window_seconds}s) from {source_ip}"
+                )
+                info = {
+                    "message": msg,
+                    "severity": "HIGH",
+                    "distinct_count": distinct_count,
+                    "probed_paths": distinct_paths
+                }
+                return True, info
+
+            return False, None
+
+    def reset_ip(self, source_ip: str):
+        """Reset probe history and alert tracking for a specific IP."""
+        with self._lock:
+            self.probes.pop(source_ip, None)
+            self.last_alert_time.pop(source_ip, None)
+            keys_to_remove = [k for k in self.explicit_path_alerts if k[0] == source_ip]
+            for k in keys_to_remove:
+                del self.explicit_path_alerts[k]
+
+    def _prune_stale(self, now: float):
+        window_start = now - self.window_seconds
+        stale_ips = [
+            ip for ip, probes in self.probes.items()
+            if not probes or probes[-1][0] <= window_start
+        ]
+        for ip in stale_ips:
+            self.probes.pop(ip, None)
+            self.last_alert_time.pop(ip, None)
+
+        cooldown_cutoff = now - max(self.window_seconds, self.cooldown_seconds * 2)
+        stale_alerts = [
+            k for k, ts in self.explicit_path_alerts.items()
+            if ts <= cooldown_cutoff
+        ]
+        for k in stale_alerts:
+            self.explicit_path_alerts.pop(k, None)
+
+
 class WAFInspector:
     """
     Application-level request inspection and policy enforcement engine.
@@ -155,7 +256,18 @@ class WAFInspector:
 
     # Reconnaissance tools and sensitive paths
     SCANNER_AGENTS = ["nmap", "nikto", "masscan", "zgrab", "gobuster", "dirbuster", "ffuf", "sqlmap"]
-    SENSITIVE_PATHS = ["/.env", "/wp-admin", "/phpmyadmin", "/.git", "/config.php", "/backup.zip", "/admin.php"]
+    SENSITIVE_PATHS = [
+        "/.env", "/.git", "/.svn", "/.htaccess", "/.aws", "/.ssh",
+        "/wp-admin", "/wp-login", "/wp-content", "/xmlrpc.php",
+        "/phpmyadmin", "/pma", "/adminer",
+        "/config.php", "/configuration.php", "/settings.py", "/database.yml",
+        "/backup.zip", "/backup.tar", "/backup.sql", "/dump.sql",
+        "/admin.php", "/administrator", "/webadmin", "/login.php",
+        "/actuator", "/actuator/env", "/actuator/health",
+        "/server-status", "/server-info",
+        "/phpinfo.php", "/info.php",
+        "/console", "/shell", "/c99.php"
+    ]
 
     def __init__(self, config: Optional[WAFConfig] = None):
         self.config = config or WAFConfig()
@@ -165,6 +277,22 @@ class WAFInspector:
             lockout_seconds=self.config.auth_lockout_seconds,
             decay_seconds=self.config.auth_decay_seconds
         )
+
+    def is_explicit_suspicious_path(self, path: str) -> Tuple[bool, Optional[str]]:
+        """Check whether path matches known explicit suspicious sensitive indicators."""
+        norm = self.normalize_string(path).lower()
+        for fpath in self.SENSITIVE_PATHS:
+            if fpath in norm:
+                return True, fpath
+        suspicious_extensions = (
+            ".env", ".git", ".sql", ".bak", ".backup", ".old", ".conf",
+            ".ini", ".yml", ".yaml", ".log", ".tar.gz", ".zip"
+        )
+        base_path = norm.split("?")[0].strip()
+        for ext in suspicious_extensions:
+            if base_path.endswith(ext):
+                return True, ext
+        return False, None
 
     def normalize_string(self, value: str) -> str:
         """Apply safe URL unquoting and lowercase conversion."""

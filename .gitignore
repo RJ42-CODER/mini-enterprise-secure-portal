@@ -6,18 +6,25 @@
 *.key
 *.cert
 *.crt
+*.pfx
+*.p12
+id_rsa*
+*.secret
 
 # Python runtime and bytecode
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.pyd
 
 # Distribution / packaging
 build/
 dist/
 *.egg-info/
 .eggs/
+wheels/
+*.whl
 
 # Virtual environments
 venv/
@@ -26,10 +33,13 @@ ENV/
 .venv/
 env.bak/
 venv.bak/
+*-venv/
 
 # Testing & Cache
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 .tox/
 .nox/
@@ -40,6 +50,7 @@ htmlcov/
 logs/*
 !logs/.gitkeep
 *.log
+*.log.*
 *.jsonl
 
 # IDE & Editor files
@@ -48,6 +59,7 @@ logs/*
 *.swp
 *.swo
 *~
+.agents/
 
 # Backup & temporary files
 *.bak
@@ -56,19 +68,30 @@ logs/*
 *.orig
 *.rej
 *.tmp
+*.temp
+*.pid
 
 # Network packet captures & dumps
 *.pcap
 *.pcapng
 *.cap
+*.dmp
 
 # Local databases
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 *.sqlite3
 
-# Operating System files
+# Operating System & VirtualBox / VM files
 .DS_Store
 Thumbs.db
 desktop.ini
+.fuse_hidden*
+*.vdi
+*.vbox
+*.vbox-prev
+
 
