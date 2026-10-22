@@ -93,6 +93,20 @@ cat << 'EOF' > /usr/share/nginx/html/403_waf.html
 </html>
 EOF
 
+cat << 'EOF' > /usr/share/nginx/html/429_ratelimit.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"><title>429 Too Many Requests</title>
+    <style>body{font-family:sans-serif;background:#0f172a;color:#f8fafc;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}
+    .c{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:30px 40px;text-align:center;max-width:440px;}
+    .b{background:#f59e0b;color:#fff;font-size:12px;font-weight:bold;padding:4px 8px;border-radius:9999px;display:inline-block;margin-bottom:12px;}
+    h1{margin:0 0 10px;font-size:20px;}p{color:#94a3b8;font-size:14px;line-height:1.5;margin:0;}</style>
+</head>
+<body><div class="c"><div class="b">RATE LIMITED</div><h1>429 Too Many Requests</h1><p>Your request rate exceeded the server limit. Please slow down and try again.</p></div></body>
+</html>
+EOF
+
 # 6. Syntax validation (non-destructive)
 echo "[6/6] Validating Nginx and ModSecurity configuration syntax..."
 nginx -t

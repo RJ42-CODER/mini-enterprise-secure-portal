@@ -14,6 +14,10 @@ class EventLogger:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_dir / "security.log"
 
+        self.mitigation_log_file = self.log_dir / "mitigations.log"
+        import threading
+        self._mitigation_lock = threading.Lock()
+
         # Setup local file logger
         self.logger = logging.getLogger("hp_victus_security")
         self.logger.setLevel(logging.INFO)
@@ -22,6 +26,15 @@ class EventLogger:
             formatter = logging.Formatter('{"time":"%(asctime)s", "level":"%(levelname)s", "event":%(message)s}')
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
+
+    def log_mitigation(self, record: Dict[str, Any]):
+        """Persist structured mitigation evidence record to local disk ledger."""
+        with self._mitigation_lock:
+            try:
+                with open(self.mitigation_log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record) + "\n")
+            except OSError as err:
+                print(f"[!] Warning: Failed to write to mitigation log: {err}")
 
     def log_and_format(
         self,

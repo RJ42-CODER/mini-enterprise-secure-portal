@@ -1,0 +1,36 @@
+[Unit]
+Description=Secure Portal Network Sniffer & Port Scan Detection Daemon
+After=network.target network-online.target nginx.service
+Wants=network-online.target
+Documentation=https://github.com/RJ42-CODER/mini-enterprise-secure-portal
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/secure-portal
+EnvironmentFile=/opt/secure-portal/.env
+ExecStart=/opt/secure-portal/venv/bin/python -m security_agent.network_sniffer
+Restart=on-failure
+RestartSec=5s
+
+# Single-instance enforcement via PID file
+PIDFile=/opt/secure-portal/logs/network_sniffer.pid
+
+# Standard output and error logging to systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=portal-sniffer
+
+# Process Management & Signal Termination
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+# Hardening / Capabilities:
+# If executed under a dedicated non-root user (e.g., User=secureportal),
+# uncomment the ambient capability grants below for packet capture:
+# AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

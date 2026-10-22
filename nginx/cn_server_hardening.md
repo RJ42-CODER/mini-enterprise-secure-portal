@@ -127,3 +127,4 @@ Reload Nginx to enforce active rejection.
 | **Oversized Request Body**| Nginx `client_max_body_size` | Flask `MAX_CONTENT_LENGTH` | `DIR_FUZZ` | T1499 (Endpoint DoS) |
 | **Rate Limit Exceeded** | Nginx `limit_req_zone` | `RateLimiter` (120 req/min) | `DIR_FUZZ` | T1499 (Endpoint DoS) |
 | **Brute-Force Lockout** | Fail2ban / IP Tables | `BruteForceProtector` (3 fails) | `BRUTE_FORCE_AUTH` | T1110 (Brute Force) |
+| **TCP Port Scanning**    | nftables Packet Drop | `PortScanTracker` (Sliding Window) | `PORT_SCAN` | T1046 (Network Service Discovery) |
