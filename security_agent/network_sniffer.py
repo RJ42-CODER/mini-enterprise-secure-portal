@@ -458,10 +458,15 @@ class NetworkSniffer:
         elif tcpdump_path:
             cmd = [
                 tcpdump_path,
-                "-l", "-nn", "-q",
+                "-l", "-nn",
                 "-i", self.interface,
                 "tcp[tcpflags] & (tcp-syn) != 0 and tcp[tcpflags] & (tcp-ack) == 0"
             ]
+            # NOTE: Do NOT add -q here. The -q (quiet) flag suppresses the
+            # 'Flags [S]' field that the parser regex requires to identify SYN
+            # packets and extract source/destination.  With -q the output is
+            # 'IP src.p > dst.p: tcp 0' which the regex cannot match, so every
+            # captured packet is silently dropped and no alerts are ever fired.
 
         if not cmd:
             return False
@@ -484,17 +489,42 @@ class NetworkSniffer:
             return False
 
     def _pcap_worker(self):
-        """Parse tshark/tcpdump stdout stream into structured telemetry."""
+        """
+        Parse tshark/tcpdump stdout stream into structured telemetry.
+
+        tcpdump line format (WITHOUT -q flag, which this code requires):
+            HH:MM:SS.usec [iface In] IP src.sport > dst.dport: Flags [S], seq N, length N
+
+        The -q flag suppresses the 'Flags [...]' field entirely, making the
+        main regex unmatchable.  Do NOT add -q to the tcpdump command.
+        """
         if not self._proc or not self._proc.stdout:
             return
 
         import re
+        _debug = os.getenv("SNIFFER_DEBUG", "").lower() in ("1", "true", "yes")
+
+        # Primary regex: matches full tcpdump output (with Flags field).
+        # Works with and without interface-name prefix (e.g. 'enp0s8 In').
         tcpdump_regex = re.compile(
             r"^(?:(?P<timestamp>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+)?.*?"
             r"IP\s+(?P<src_ip>\d{1,3}(?:\.\d{1,3}){3})\.(?P<src_port>\d+)\s*>\s*"
             r"(?P<dst_ip>\d{1,3}(?:\.\d{1,3}){3})\.(?P<dst_port>\d+):\s*"
             r"Flags\s*\[(?P<flags>.*?)\]"
         )
+
+        # Fallback regex: matches tcpdump lines that lack 'Flags' (e.g. some
+        # distro-specific builds or unexpected -q output).  We cannot verify
+        # SYN-only status here, so we treat every matched packet as a SYN probe
+        # and rely on the BPF filter ('tcp-syn != 0 and tcp-ack == 0') to
+        # guarantee only SYNs reach us.
+        tcpdump_noflags_regex = re.compile(
+            r"^(?:(?P<timestamp>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+)?.*?"
+            r"IP\s+(?P<src_ip>\d{1,3}(?:\.\d{1,3}){3})\.(?P<src_port>\d+)\s*>\s*"
+            r"(?P<dst_ip>\d{1,3}(?:\.\d{1,3}){3})\.(?P<dst_port>\d+):"
+        )
+
+        unmatched_count = 0  # diagnostic counter
 
         for line in self._proc.stdout:
             if not self.running:
@@ -517,6 +547,9 @@ class NetworkSniffer:
                         target_ip = os.getenv("CN_SERVER_IP")
                         if target_ip and dst_ip and dst_ip != target_ip:
                             continue
+
+                        if _debug:
+                            print(f"[D] [SNIFFER] tshark pkt: src={src_ip} dst={dst_ip}:{dst_port} flags={flags}")
 
                         self.handle_probe(
                             source_ip=src_ip,
@@ -554,7 +587,12 @@ class NetworkSniffer:
                     if target_ip and dst_ip != target_ip:
                         continue
 
-                    # Filter for SYN packets without ACK
+                    if _debug:
+                        print(f"[D] [SNIFFER] tcpdump pkt: src={src_ip} dst={dst_ip}:{dst_port} flags=[{flags}]")
+
+                    # Filter for SYN packets without ACK (BPF already filters,
+                    # but we double-check in case of ACK-SYN re-transmits
+                    # reaching the listener due to interface capture quirks).
                     if "S" in flags and "." not in flags:
                         self.handle_probe(
                             source_ip=src_ip,
@@ -564,6 +602,40 @@ class NetworkSniffer:
                             timestamp=pkt_time,
                             destination_ip=dst_ip
                         )
+                else:
+                    # Try fallback (no-Flags) regex
+                    fb_match = tcpdump_noflags_regex.search(line_str)
+                    if fb_match:
+                        src_ip = fb_match.group("src_ip")
+                        dst_ip = fb_match.group("dst_ip")
+                        dst_port_str = fb_match.group("dst_port")
+                        pkt_time = fb_match.group("timestamp")
+
+                        target_ip = os.getenv("CN_SERVER_IP")
+                        if target_ip and dst_ip != target_ip:
+                            continue
+
+                        try:
+                            dst_port = int(dst_port_str)
+                        except ValueError:
+                            continue
+
+                        # BPF filter guarantees SYN-only, so treat as SYN
+                        print(f"[~] [SNIFFER] Fallback parse (no Flags field): "
+                              f"src={src_ip} dst={dst_ip}:{dst_port} "
+                              f"(check: is -q flag absent from tcpdump cmd?)")
+                        self.handle_probe(
+                            source_ip=src_ip,
+                            destination_port=dst_port,
+                            protocol="TCP",
+                            flags="SYN",
+                            timestamp=pkt_time,
+                            destination_ip=dst_ip
+                        )
+                    else:
+                        unmatched_count += 1
+                        if _debug or unmatched_count <= 3:
+                            print(f"[D] [SNIFFER] Unmatched tcpdump line #{unmatched_count}: {line_str[:120]!r}")
 
     def start(self, enforce_single_instance: bool = False) -> bool:
         """Start sniffer engine (pcap + canary listeners)."""
