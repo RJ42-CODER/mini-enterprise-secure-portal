@@ -94,4 +94,6 @@ desktop.ini
 *.vbox
 *.vbox-prev
 
+# Local submodules and external test checkouts
+soc_project/
 

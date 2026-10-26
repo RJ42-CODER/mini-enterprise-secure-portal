@@ -310,3 +310,53 @@ def test_detector_heartbeat_payload():
         assert hb["event_type"] == "HEARTBEAT"
         assert hb["source_ip"] == "192.168.31.91"
         assert hb["destination_port"] == 5000
+
+
+def test_env_new_security_variables_loaded_and_parsed():
+    """Verify that new rate-anomaly, proxy, and ML settings are loaded and typed correctly from .env."""
+    from security_agent.config import load_portal_env, get_trusted_proxies
+    from security_agent.rate_anomaly_detector import RateAnomalyConfig
+    from security_agent.ml_detector import MLAnomalyDetector
+    from security_agent.waf import WAFConfig
+
+    loaded = load_portal_env()
+    assert loaded is True
+
+    rac = RateAnomalyConfig()
+    assert isinstance(rac.enabled, bool)
+    assert isinstance(rac.window_seconds, float)
+    assert isinstance(rac.threshold, int)
+    assert isinstance(rac.burst_window_seconds, float)
+    assert isinstance(rac.burst_threshold, int)
+    assert isinstance(rac.cooldown_seconds, float)
+    assert isinstance(rac.max_tracked_identities, int)
+    assert isinstance(rac.excluded_paths, set)
+    assert "/health" in rac.excluded_paths
+
+    proxies = get_trusted_proxies()
+    assert isinstance(proxies, set)
+    assert "127.0.0.1" in proxies
+
+    mld = MLAnomalyDetector()
+    assert isinstance(mld.enabled, bool)
+
+    waf = WAFConfig()
+    assert isinstance(waf.dir_fuzz_threshold, int)
+    assert isinstance(waf.auth_lockout_max_seconds, int)
+    assert isinstance(waf.rate_limit_burst, int)
+
+
+def test_env_rate_anomaly_defaults_when_absent():
+    """Verify safe fallback defaults when rate-anomaly variables are absent."""
+    from security_agent.rate_anomaly_detector import RateAnomalyConfig
+
+    with patch.dict(os.environ, {}, clear=True):
+        rac = RateAnomalyConfig()
+        assert rac.enabled is True
+        assert rac.window_seconds == 10.0
+        assert rac.threshold == 15
+        assert rac.burst_window_seconds == 2.0
+        assert rac.burst_threshold == 8
+        assert rac.cooldown_seconds == 30.0
+        assert rac.max_tracked_identities == 2000
+        assert "/health" in rac.excluded_paths

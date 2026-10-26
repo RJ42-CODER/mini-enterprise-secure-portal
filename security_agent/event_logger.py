@@ -5,6 +5,16 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
 
+try:
+    from .config import redact_sensitive_data
+except ImportError:
+    try:
+        from config import redact_sensitive_data
+    except ImportError:
+        def redact_sensitive_data(val):
+            return val
+
+
 class EventLogger:
     """Logs security events locally on HP Victus server and forwards to SOC."""
 
@@ -31,8 +41,9 @@ class EventLogger:
         """Persist structured mitigation evidence record to local disk ledger."""
         with self._mitigation_lock:
             try:
+                sanitized_record = redact_sensitive_data(record)
                 with open(self.mitigation_log_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(record) + "\n")
+                    f.write(json.dumps(sanitized_record) + "\n")
             except OSError as err:
                 print(f"[!] Warning: Failed to write to mitigation log: {err}")
 
@@ -59,6 +70,7 @@ class EventLogger:
             ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
 
         sig = signature or alert_type or event_type
+        sanitized_metadata = redact_sensitive_data(metadata or {})
         event = {
             "event_id": event_id,
             "timestamp": ts,
@@ -73,7 +85,7 @@ class EventLogger:
             "destination_port": destination_port,
             "protocol": protocol,
             "message": message,
-            "metadata": metadata or {},
+            "metadata": sanitized_metadata,
             "is_test": is_test
         }
         self.logger.info(json.dumps(event))

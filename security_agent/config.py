@@ -6,7 +6,7 @@ telemetry and network parameters.
 
 import os
 from pathlib import Path
-from typing import Dict, Any, Optional, Union, List
+from typing import Dict, Any, Optional, Union, List, Set
 
 
 def get_project_root() -> Path:
@@ -120,25 +120,77 @@ def validate_portal_config() -> Dict[str, Any]:
     }
 
 
-def get_client_ip(req) -> str:
+def get_trusted_proxies() -> Set[str]:
+    """Return configured set of trusted proxy IP addresses."""
+    trusted_env = os.getenv("TRUSTED_PROXIES", "")
+    env_proxies = {p.strip() for p in trusted_env.split(",") if p.strip()}
+    trusted: Set[str] = {"127.0.0.1", "::1", "localhost"} | env_proxies
+    server_ip = os.getenv("CN_SERVER_IP")
+    if server_ip and server_ip.strip():
+        trusted.add(server_ip.strip())
+    return trusted
+
+
+def get_client_ip(req, trusted_proxies: Optional[Set[str]] = None) -> str:
     """
-    Extract authentic client IP from reverse-proxy headers (X-Forwarded-For, X-Real-IP)
-    or direct socket remote_addr.
+    Extract authentic client IP accounting for trusted reverse-proxy configuration.
+    Forwarding headers (X-Forwarded-For, X-Real-IP) are ONLY trusted if the direct peer
+    (req.remote_addr) is an explicitly verified trusted proxy (e.g. Nginx on loopback).
+    Never trusts arbitrary client-supplied forwarding headers from untrusted connections.
     """
+    direct_remote = getattr(req, "remote_addr", None) or "127.0.0.1"
+
+    allowed_proxies = trusted_proxies if trusted_proxies is not None else get_trusted_proxies()
+
+    # If the direct peer is not an authorized trusted proxy, ignore all forwarding headers
+    if direct_remote not in allowed_proxies:
+        return direct_remote
+
+    headers = getattr(req, "headers", {})
+
     # 1. Check X-Forwarded-For (standard header; leftmost IP is the original client)
-    forwarded_for = req.headers.get("X-Forwarded-For")
+    forwarded_for = headers.get("X-Forwarded-For")
     if forwarded_for:
         parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
         if parts:
             return parts[0]
 
     # 2. Check X-Real-IP (set by Nginx proxy_set_header X-Real-IP $remote_addr)
-    real_ip = req.headers.get("X-Real-IP")
+    real_ip = headers.get("X-Real-IP")
     if real_ip and real_ip.strip():
         return real_ip.strip()
 
     # 3. Fallback to direct TCP socket address
-    return req.remote_addr or "127.0.0.1"
+    return direct_remote
+
+
+def redact_sensitive_data(val: Any) -> Any:
+    """
+    Recursively sanitize dictionaries, lists, and strings to redact credentials,
+    passwords, bearer tokens, and API keys.
+    """
+    sensitive_keys = {
+        "password", "pass", "pwd", "secret", "token", "api_key", "apikey",
+        "soc_api_key", "soc_agent_token", "authorization", "auth", "cookie"
+    }
+    if isinstance(val, dict):
+        sanitized = {}
+        for k, v in val.items():
+            if str(k).lower() in sensitive_keys:
+                sanitized[k] = "[REDACTED]"
+            else:
+                sanitized[k] = redact_sensitive_data(v)
+        return sanitized
+    elif isinstance(val, (list, tuple, set)):
+        sanitized_list = [redact_sensitive_data(item) for item in val]
+        return type(val)(sanitized_list)
+    elif isinstance(val, str):
+        # Redact Bearer tokens in headers
+        if "Bearer " in val:
+            import re
+            return re.sub(r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer [REDACTED]", val)
+        return val
+    return val
 
 
 # Automatically execute env loading upon module import

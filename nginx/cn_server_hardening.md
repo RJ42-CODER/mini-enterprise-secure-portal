@@ -125,6 +125,30 @@ Reload Nginx to enforce active rejection.
 | **Reconnaissance Fuzzing** | CRS 913xxx (Scanner UA) | `WAFInspector.SCANNER_AGENTS` | `DIR_FUZZ` | T1595 (Active Scanning) |
 | **Disallowed HTTP Method**| Nginx `REQUEST_METHOD` | `WAFInspector.config.allowed_methods`| `DIR_FUZZ` | T1595 (Active Scanning) |
 | **Oversized Request Body**| Nginx `client_max_body_size` | Flask `MAX_CONTENT_LENGTH` | `DIR_FUZZ` | T1499 (Endpoint DoS) |
-| **Rate Limit Exceeded** | Nginx `limit_req_zone` | `RateLimiter` (120 req/min) | `DIR_FUZZ` | T1499 (Endpoint DoS) |
+| **HTTP Rate-Anomaly** | Detection Pipeline | `RateAnomalyTracker` (Rolling Window) | `HTTP_RATE_ANOMALY` | T1499 (Endpoint DoS) |
 | **Brute-Force Lockout** | Fail2ban / IP Tables | `BruteForceProtector` (3 fails) | `BRUTE_FORCE_AUTH` | T1110 (Brute Force) |
 | **TCP Port Scanning**    | nftables Packet Drop | `PortScanTracker` (Sliding Window) | `PORT_SCAN` | T1046 (Network Service Discovery) |
+
+---
+
+## 5. Defense-in-Depth: Rate Limiting vs. Anomaly Detection vs. Firewall
+
+The architecture separates network, perimeter, application, and anomaly layers:
+
+| Layer | Component | Mechanism | Action | Primary Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| **Host Firewall** | `nftables` | Packet state & port filtering | Hard Drop | Prevents unauthorized external connection to loopback services (TCP 5000) |
+| **Reverse Proxy** | `nginx` | `limit_req_zone` (10r/s burst=20) | HTTP 429 | Protects reverse proxy server buffers and upstream worker exhaustion |
+| **Application WAF**| `RateLimiter` | Sliding 60s per-IP quota | HTTP 429 | Prevents application API exhaustion at business logic level |
+| **Anomaly Pipeline**| `RateAnomalyTracker`| Rolling window & burst metrics | Structured SOC Alert | Early investigative warning; does NOT block legitimate clients |
+
+### Trusted Proxy Verification
+To prevent IP spoofing, `get_client_ip` enforces that forwarding headers (`X-Forwarded-For`, `X-Real-IP`) are **only** evaluated when the direct peer socket (`remote_addr`) belongs to an authorized trusted proxy (`127.0.0.1`, `::1`, `localhost`, or configured `TRUSTED_PROXIES`). Untrusted direct connections strictly use `remote_addr`.
+
+---
+
+## 6. SSRF Audit & Outbound Request Security
+
+- **Application Surface Audit**: All exposed Flask routes (`/`) were audited. The portal contains no features that accept client-supplied URLs, webhooks, or server-side URL fetching. SSRF is **not applicable to the currently exposed application functionality**.
+- **Outbound Service Security**: Outbound network connections are strictly limited to authenticated SOC telemetry delivery via `AlertClient`.
+- **SSRF Prevention Utilities**: `security_agent/ssrf_validator.py` provides validation of destination URLs, rejecting cloud metadata (`169.254.169.254`), link-local, loopback, private ranges, and non-HTTP schemes.

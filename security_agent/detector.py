@@ -11,22 +11,44 @@ if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
 try:
-    from .config import load_portal_env
+    from .config import load_portal_env, redact_sensitive_data
     load_portal_env()
     from .event_logger import EventLogger
     from .alert_client import AlertClient
     from .waf import WAFInspector, WAFConfig, DirectoryFuzzTracker
     from .defense_policy import SafeDefensivePolicy
+    from .rate_anomaly_detector import RateAnomalyTracker, RateAnomalyConfig
+    from .ml_detector import MLAnomalyDetector
+    from .detection_pipeline import ExtensibleDetectionPipeline, RequestContext, DetectionResult
 except (ImportError, ValueError):
     try:
-        from config import load_portal_env
+        from config import load_portal_env, redact_sensitive_data
         load_portal_env()
     except ImportError:
-        pass
+        def redact_sensitive_data(val):
+            return val
     from event_logger import EventLogger
     from alert_client import AlertClient
     from waf import WAFInspector, WAFConfig, DirectoryFuzzTracker
     from defense_policy import SafeDefensivePolicy
+    from rate_anomaly_detector import RateAnomalyTracker, RateAnomalyConfig
+    from ml_detector import MLAnomalyDetector
+    from detection_pipeline import ExtensibleDetectionPipeline, RequestContext, DetectionResult
+
+class _FailedLoginsDict(dict):
+    """Tracking dictionary for failed logins with automatic rate anomaly reset hook on clear()."""
+    def __init__(self, detector, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._detector = detector
+
+    def clear(self):
+        super().clear()
+        if hasattr(self._detector, "rate_anomaly_tracker") and self._detector.rate_anomaly_tracker:
+            with self._detector.rate_anomaly_tracker._lock:
+                self._detector.rate_anomaly_tracker.requests.clear()
+                self._detector.rate_anomaly_tracker.last_alert_time.clear()
+                self._detector.rate_anomaly_tracker.last_seen.clear()
+
 
 class ServerDetector:
     """Security detection engine operating on protected server."""
@@ -46,10 +68,13 @@ class ServerDetector:
         )
         self.waf = WAFInspector(fuzz_tracker=self.fuzz_tracker)
         # ip -> list of failure timestamps (sliding window)
-        self.failed_logins: Dict[str, List[float]] = {}
+        self.failed_logins: Dict[str, List[float]] = _FailedLoginsDict(self)
         self.auth_decay_seconds = int(os.getenv("WAF_AUTH_DECAY_SECONDS", "300"))
         self.defense_policy = SafeDefensivePolicy()
         self.mitigation_history: List[Dict[str, Any]] = []
+        self.rate_anomaly_tracker = RateAnomalyTracker()
+        self.ml_detector = MLAnomalyDetector()
+        self.pipeline = ExtensibleDetectionPipeline()
 
     def record_mitigation(
         self,
@@ -107,17 +132,44 @@ class ServerDetector:
             "active_policy_blocks": self.defense_policy.get_active_blocks()
         }
 
+    def clear_all_trackers(self):
+        """Reset all in-memory tracking state (WAF, brute-force, fuzzing, rate anomaly)."""
+        self.failed_logins.clear()
+        if hasattr(self, "rate_anomaly_tracker") and self.rate_anomaly_tracker:
+            with self.rate_anomaly_tracker._lock:
+                self.rate_anomaly_tracker.requests.clear()
+                self.rate_anomaly_tracker.last_alert_time.clear()
+                self.rate_anomaly_tracker.last_seen.clear()
+        if hasattr(self, "fuzz_tracker") and self.fuzz_tracker:
+            with self.fuzz_tracker._lock:
+                self.fuzz_tracker.probes.clear()
+                self.fuzz_tracker.throttles.clear()
+                self.fuzz_tracker.last_alert_time.clear()
+                self.fuzz_tracker.throttle_tiers.clear()
+                self.fuzz_tracker.explicit_path_alerts.clear()
+        if hasattr(self, "waf") and hasattr(self.waf, "rate_limiter"):
+            with self.waf.rate_limiter._lock:
+                self.waf.rate_limiter.requests.clear()
+        if hasattr(self, "waf") and hasattr(self.waf, "brute_force_protector"):
+            with self.waf.brute_force_protector._lock:
+                self.waf.brute_force_protector.failures.clear()
+                self.waf.brute_force_protector.lockouts.clear()
+                self.waf.brute_force_protector.lockout_tiers.clear()
+
     def reset_ip_defenses(self, source_ip: str, reason: str = "administrative_release") -> Dict[str, Any]:
         """Administrative rollback / reset of all defensive restrictions for a given IP."""
         self.waf.brute_force_protector.reset_ip(source_ip)
         self.fuzz_tracker.reset_ip(source_ip)
         self.failed_logins.pop(source_ip, None)
+        if hasattr(self, "rate_anomaly_tracker"):
+            self.rate_anomaly_tracker.reset_ip(source_ip)
         rollback_info = self.defense_policy.rollback_block(source_ip, reason=reason)
         evidence = {
             "reason": reason,
             "policy_released": True,
             "brute_force_reset": True,
             "fuzz_throttle_reset": True,
+            "rate_anomaly_reset": True,
             "verification_status": "VERIFIED"
         }
         if rollback_info:
@@ -183,6 +235,40 @@ class ServerDetector:
             )
 
         if not detection:
+            # Deterministic WAF inspection passed (no attack signature detected).
+            # Evaluate HTTP rate-anomaly detection across sliding time windows:
+            if hasattr(self, "rate_anomaly_tracker") and self.rate_anomaly_tracker:
+                is_anomaly, anomaly_info = self.rate_anomaly_tracker.record_request(
+                    source_ip=source_ip,
+                    path=path,
+                    method=method
+                )
+                if is_anomaly and anomaly_info:
+                    return self.record_rate_anomaly(
+                        source_ip=source_ip,
+                        path=path,
+                        method=method,
+                        anomaly_info=anomaly_info
+                    )
+
+            # Evaluate machine-learning anomaly inference (investigative signal)
+            if hasattr(self, "ml_detector") and self.ml_detector:
+                ml_info = self.ml_detector.evaluate_request(
+                    path=path,
+                    method=method,
+                    headers=headers,
+                    query_string=query_string,
+                    body=body,
+                    content_length=content_length
+                )
+                if ml_info:
+                    return self.record_ml_anomaly(
+                        source_ip=source_ip,
+                        path=path,
+                        method=method,
+                        ml_info=ml_info
+                    )
+
             return None
 
         # Sanitize metadata for SOC event to avoid echoing long bodies or secrets
@@ -235,6 +321,97 @@ class ServerDetector:
             event["_mitigation"] = mitigation_record
             mitigation_record["event_id"] = event.get("event_id")
 
+        return event
+
+    def record_rate_anomaly(
+        self,
+        source_ip: str,
+        path: str,
+        method: str,
+        anomaly_info: Dict[str, Any],
+        response_status: int = 200
+    ) -> Dict[str, Any]:
+        """
+        Record and transmit structured HTTP rate-anomaly detection alert conforming to SOC event contract.
+        Separates anomaly detection from enforcement (request is not automatically blocked).
+        """
+        sev = anomaly_info.get("severity", "MEDIUM")
+        msg = anomaly_info.get("message", "HTTP request rate anomaly detected")
+        evidence = anomaly_info.get("evidence", {})
+        window_sec = anomaly_info.get("measurement_window_seconds", self.rate_anomaly_tracker.config.window_seconds)
+        thresh = anomaly_info.get("configured_threshold", self.rate_anomaly_tracker.config.threshold)
+        req_count = anomaly_info.get("request_count", 0)
+
+        meta = {
+            "affected_endpoint": path,
+            "http_method": method.upper(),
+            "request_count": req_count,
+            "measurement_window_seconds": window_sec,
+            "configured_threshold": thresh,
+            "detection_category": "RATE_ANOMALY",
+            "detection_method": "SLIDING_WINDOW",
+            "is_burst": anomaly_info.get("is_burst", False),
+            "severity": sev,
+            "supporting_evidence": evidence,
+            "evidence": evidence,
+            "response_status": response_status,
+            "classification": "SINGLE_SOURCE_RATE_ANOMALY",
+            "mitre_technique": "T1499",
+            "mitre_name": "Endpoint Denial of Service",
+            "asset": f"Protected Web Server ({self.cn_server_ip})"
+        }
+
+        event = self._trigger_event(
+            event_type="RATE_ANOMALY",
+            signature="HTTP_RATE_ANOMALY",
+            severity=sev,
+            source_ip=source_ip,
+            destination_port=self.server_port,
+            message=msg,
+            metadata=meta
+        )
+        if event:
+            event["_waf_blocked"] = False
+            event["_rate_anomaly"] = True
+            event["_anomaly_info"] = anomaly_info
+        return event
+
+    def record_ml_anomaly(
+        self,
+        source_ip: str,
+        path: str,
+        method: str,
+        ml_info: Dict[str, Any],
+        response_status: int = 200
+    ) -> Dict[str, Any]:
+        """
+        Record and transmit investigative machine-learning anomaly signal.
+        Treated strictly as an investigative indicator; not definitive proof of an attack.
+        """
+        sev = ml_info.get("severity", "LOW")
+        msg = ml_info.get("message", "Investigative ML anomaly signal")
+        meta = dict(ml_info.get("metadata", {}))
+        meta.update({
+            "affected_endpoint": path,
+            "http_method": method.upper(),
+            "detection_category": "MACHINE_LEARNING",
+            "detection_method": "HEURISTIC_FEATURE_INFERENCE",
+            "response_status": response_status,
+            "asset": f"Protected Web Server ({self.cn_server_ip})"
+        })
+
+        event = self._trigger_event(
+            event_type="ML_ANOMALY",
+            signature="ML_HTTP_ANOMALY",
+            severity=sev,
+            source_ip=source_ip,
+            destination_port=self.server_port,
+            message=msg,
+            metadata=meta
+        )
+        if event:
+            event["_waf_blocked"] = False
+            event["_ml_signal"] = True
         return event
 
     def inspect_and_filter(

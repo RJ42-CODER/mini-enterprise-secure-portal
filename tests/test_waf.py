@@ -29,6 +29,7 @@ def test_client():
     from app import detector
     with patch.object(detector.client, '_flush_spool_quietly'):
         # Reset WAF tracking state between tests
+        detector.clear_all_trackers()
         detector.waf.rate_limiter = RateLimiter(limit_per_minute=20)
         detector.waf.brute_force_protector = BruteForceProtector(
             threshold=3, lockout_seconds=2, decay_seconds=10

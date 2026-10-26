@@ -133,6 +133,8 @@ Outgoing alerts sent to `POST {SOC_URL}/api/events` conform to the following JSO
 - `DIR_FUZZ` (Severity: `HIGH`)
 - `BRUTE_FORCE_AUTH` (Severity: `LOW` on initial failure, `HIGH` on ≥3 attempts within 5 minutes)
 - `PORT_SCAN` (Severity: `HIGH` for aggregated scan detections, `LOW` for individual probe records; mapped to MITRE ATT&CK T1046)
+- `HTTP_RATE_ANOMALY` (Severity: `MEDIUM` for threshold crossing, `HIGH` for velocity bursts; mapped to MITRE ATT&CK T1499)
+- `ML_HTTP_ANOMALY` (Severity: `LOW`/`MEDIUM`; investigative statistical feature anomaly signal)
 
 ---
 
